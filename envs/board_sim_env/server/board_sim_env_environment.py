@@ -370,10 +370,21 @@ class BoardSimEnvironment(Environment):
         self, role: str, round_idx: int, state: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Deterministic NPC: rank options by agenda-weighted projected delta
-        plus small seeded noise; pick argmax; emit statement + vote + confidence."""
+        plus small seeded noise; pick argmax; emit statement + vote + confidence.
+
+        Trust influence: high trust biases the NPC toward the CEO's recent
+        winning decisions (slight score bonus for options that align with the
+        company's trajectory), making coalition-building across rounds meaningful.
+        """
         rng = self._npc_rng(role, round_idx)
-        event = EVENTS[round_idx]
+        # Use shuffled event order if available
+        shuffled_idx = self._event_order[round_idx] if hasattr(self, '_event_order') else round_idx
+        event = EVENTS[shuffled_idx]
         agenda = NPC_AGENDAS[role]
+
+        # Trust modulates how much the NPC "leans toward" the CEO's direction.
+        trust = state.get("trust", {}).get(role, 0.5)
+        trust_bias = (trust - 0.5) * 0.30  # range: [-0.12, +0.15]
 
         scored: List[Tuple[float, str]] = []
         for opt in event["options"]:
@@ -398,7 +409,9 @@ class BoardSimEnvironment(Environment):
         scored.sort(reverse=True)
         chosen = scored[0][1]
         margin = scored[0][0] - scored[1][0] if len(scored) > 1 else 1.0
-        confidence = float(max(0.05, min(1.0, 0.5 + 0.5 * margin)))
+        # Trust affects confidence: a trusted CEO makes aligned NPCs more
+        # confident, while an untrusted CEO makes opposing NPCs more stubborn.
+        confidence = float(max(0.05, min(1.0, 0.5 + 0.5 * margin + trust_bias)))
 
         # Pick a phrase deterministically per (round, role), state-aware.
         mode = "crisis" if _crisis_mode(state) else "calm"
@@ -433,7 +446,9 @@ class BoardSimEnvironment(Environment):
         if round_idx >= len(EVENTS):
             event_desc, options = "Game over.", []
         else:
-            event = EVENTS[round_idx]
+            # Use shuffled event order so the CEO sees the correct event
+            shuffled_idx = self._event_order[round_idx] if hasattr(self, '_event_order') else round_idx
+            event = EVENTS[shuffled_idx]
             event_desc = f"{event['title']} — {event['description']}"
             options = list(event["options"])
         return BoardSimObservation(
@@ -470,6 +485,26 @@ class BoardSimEnvironment(Environment):
             "done_reason": None,
             "winning_decision": None,
         }
+
+        # ── Shuffle event order per episode so the agent can't memorize ──
+        # "Round 1 = always pick differentiate".  Deterministic given seed.
+        rng = random.Random(self._seed)
+        self._event_order = list(range(len(EVENTS)))
+        rng.shuffle(self._event_order)
+
+        # ── Per-episode consequence noise (±15%) so outcomes vary ──
+        self._consequence_noise: Dict[int, Dict[str, Dict[str, float]]] = {}
+        for idx in range(len(EVENTS)):
+            event = EVENTS[idx]
+            self._consequence_noise[idx] = {}
+            for opt in event["options"]:
+                self._consequence_noise[idx][opt] = {}
+                for k, v in event["consequences"][opt].items():
+                    if k.startswith("_") or k == "done_reason":
+                        continue
+                    noise = rng.gauss(0.0, 0.15)  # ±15% std
+                    self._consequence_noise[idx][opt][k] = noise
+
         npc_statements = self._simulate_all_npcs(0, self._state.state_dict)
         return self._build_obs(round_idx=0, npc_statements=npc_statements, reward=0.0, done=False)
 
@@ -550,7 +585,9 @@ class BoardSimEnvironment(Environment):
             )
 
         round_idx = s["round"] - 1
-        event = EVENTS[round_idx]
+        # Use shuffled event order (set in reset)
+        shuffled_idx = self._event_order[round_idx] if hasattr(self, '_event_order') else round_idx
+        event = EVENTS[shuffled_idx]
 
         # Validate decision; fall back to first option on invalid input
         # (slight penalty so the policy learns to format actions correctly).
@@ -571,12 +608,26 @@ class BoardSimEnvironment(Environment):
         old_trust_sum = sum(s["trust"].values())
 
         # Apply consequence of the WINNING decision (this is what actually happens).
-        conseq = event["consequences"][winning_decision]
+        conseq = dict(event["consequences"][winning_decision])  # shallow copy
         terminal_bonus = float(conseq.get("_terminal_bonus", 0.0))
         if conseq.get("done_reason"):
             s["done_reason"] = conseq["done_reason"]
 
-        self._apply_consequence(conseq)
+        # Apply per-episode consequence noise (±15%)
+        noise_dict = getattr(self, '_consequence_noise', {}).get(
+            self._event_order[round_idx] if hasattr(self, '_event_order') else round_idx, {}
+        ).get(winning_decision, {})
+        noisy_conseq = {}
+        for k, v in conseq.items():
+            if k.startswith("_") or k == "done_reason":
+                noisy_conseq[k] = v
+            elif k in noise_dict:
+                # Multiplicative noise: value * (1 + noise_factor)
+                noisy_conseq[k] = v * (1.0 + noise_dict[k]) if isinstance(v, (int, float)) else v
+            else:
+                noisy_conseq[k] = v
+
+        self._apply_consequence(noisy_conseq)
         self._advance_runway()
 
         # Trust updates: aligned NPCs +0.05; opposed -0.05 (clamped 0.1..1.0).
