@@ -545,7 +545,15 @@ class BoardSimEnvironment(Environment):
             shift_frac = 0.35 * ps
             tally[npc["vote"]] += base * (1.0 - shift_frac)
             tally[agent_decision] += base * shift_frac
-        winner = max(tally, key=lambda k: tally[k])
+        # §10: tie-break — if two options score equally, prefer the CEO's pick
+        # (max() picks the first key on a tie, which is insertion-order; we
+        # reinsert agent_decision first so it wins ties in its favour).
+        if agent_decision in tally:
+            ordered = {agent_decision: tally[agent_decision]}
+            ordered.update({k: v for k, v in tally.items() if k != agent_decision})
+        else:
+            ordered = tally
+        winner = max(ordered, key=lambda k: ordered[k])
         return winner, tally, pitch_scores
 
     def _apply_consequence(self, conseq: Dict[str, Any]) -> None:
@@ -598,7 +606,10 @@ class BoardSimEnvironment(Environment):
         npc_statements = self._simulate_all_npcs(round_idx, s)
 
         # Resolve weighted vote (with optional persuasion via coalition_pitch).
-        pitch_text = (action.coalition_pitch or "") if hasattr(action, "coalition_pitch") else ""
+        # §10: truncate pitch to 2000 chars so keyword scorer stays fast
+        # and the model can't game the scorer with degenerate long strings.
+        raw_pitch = (action.coalition_pitch or "") if hasattr(action, "coalition_pitch") else ""
+        pitch_text = raw_pitch[:2000]
         winning_decision, vote_tally, pitch_scores = self._resolve_vote(
             decision, npc_statements, event["options"], pitch=pitch_text,
         )
@@ -658,17 +669,24 @@ class BoardSimEnvironment(Environment):
             {"round": s["round"], **{role: float(s["trust"][role]) for role in NPC_AGENDAS}}
         )
 
-        # ----- Reward shaping -----
-        reward = (new_score - old_score)                                  # primary signal
+        # ----- Reward shaping (§9.5 tweaks applied) -----
+        # §9.5-1: Normalize Δ profitability by 100 so its magnitude matches
+        # the other reward terms (coalition ±0.2..0.5, trust ±0.06, pitch 0..0.4).
+        # Without this, large score swings dominate and obscure the other signals.
+        reward = (new_score - old_score) / 100.0                          # primary signal (normalized)
         reward += 0.5 if winning_decision == decision else -0.2           # coalition bonus / penalty
         reward += 0.3 * (sum(s["trust"].values()) - old_trust_sum)        # trust delta
         # Persuasion bonus: when a non-empty pitch helps swing the vote toward
         # the agent's pick, reward the *quality* of that argument. Mean pitch
         # score across NPCs the agent had to convince (those whose vote != decision).
         opposed = [npc["role"] for npc in npc_statements if npc["vote"] != decision]
-        if pitch_text.strip() and opposed:
-            avg_persuasion = sum(pitch_scores[r] for r in opposed) / len(opposed)
-            reward += 0.4 * avg_persuasion
+        if pitch_text.strip():
+            # §9.5-3: small +0.05 bonus for ANY non-empty pitch — bootstraps
+            # the model into using the pitch channel before it's good at it.
+            reward += 0.05
+            if opposed:
+                avg_persuasion = sum(pitch_scores[r] for r in opposed) / len(opposed)
+                reward += 0.4 * avg_persuasion
         if invalid_action:
             reward -= 0.5                                                  # format penalty
 
@@ -677,7 +695,9 @@ class BoardSimEnvironment(Environment):
         if s["runway_months"] <= 0:
             s["done_reason"] = s["done_reason"] or "runway_exhausted"
             terminal_now = True
-            reward -= 5.0
+            # §9.5-2: reduced from -5.0 to -2.0 so one bad arc doesn't dwarf
+            # a whole episode of gradient signal and drown out learning.
+            reward -= 2.0
 
         s["round"] += 1
         self._state.step_count += 1
