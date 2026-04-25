@@ -1,0 +1,689 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+"""NeuralEdge AI Boardroom — OpenEnv environment.
+
+The agent plays the CEO of a Series B AI startup. Each of 10 rounds it sees
+a market-crisis event, statements + votes from 4 hidden-agenda NPC board
+members, and must pick one of 3 decisions. Decisions are resolved by a
+weighted vote and produce dense reward proportional to a composite
+profitability score plus coalition / trust shaping terms.
+
+NPCs are deterministic-given-(seed, round, state) — same observation in
+training and resolution — so GRPO has a stable target to learn against.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import random
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
+
+from openenv.core.env_server.interfaces import Environment
+
+try:
+    from ..models import BoardSimAction, BoardSimObservation, BoardState
+except ImportError:  # direct script execution: `python server/board_sim_env_environment.py`
+    import os, sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from models import BoardSimAction, BoardSimObservation, BoardState  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# Static config
+# ---------------------------------------------------------------------------
+
+# Per-role weighted vote influence (CEO is the agent).
+ROLE_WEIGHT: Dict[str, float] = {
+    "CEO": 1.5,
+    "CTO": 1.2,
+    "CFO": 1.0,
+    "Investor Rep": 1.3,
+    "Independent": 0.8,
+}
+
+# NPCs and their hidden agendas: weights on per-step state-deltas they
+# privately maximize. The agent never sees these.
+NPC_AGENDAS: Dict[str, Dict[str, float]] = {
+    # CTO — wants product strength + team morale; hates burn.
+    "CTO": {
+        "product_readiness": 0.55,
+        "team_morale": 0.40,
+        "burn_rate": -0.10,
+        "regulatory_risk": -0.05,
+    },
+    # CFO — burn discipline, runway, regulatory caution.
+    "CFO": {
+        "burn_rate": -0.60,
+        "revenue": 0.30,
+        "runway_months": 0.20,
+        "regulatory_risk": -0.25,
+    },
+    # Investor Rep — growth-at-all-costs.
+    "Investor Rep": {
+        "investor_confidence": 0.45,
+        "market_share": 0.35,
+        "revenue": 0.25,
+        "burn_rate": -0.05,
+    },
+    # Independent — reputation/safety; consensus seeker.
+    "Independent": {
+        "regulatory_risk": -0.45,
+        "team_morale": 0.30,
+        "investor_confidence": 0.25,
+        "market_share": 0.10,
+    },
+}
+
+# Personality phrase banks for flavorful statements. State-aware: separate
+# phrase pools for "calm" vs "crisis" mode are selected based on current
+# state (low runway / low morale / high reg risk → crisis variant).
+PHRASES: Dict[str, Dict[str, List[str]]] = {
+    "CTO": {
+        "calm": [
+            "Look, the architecture won't survive shortcuts here.",
+            "I've sketched the trade-offs — engineering's pretty clear.",
+            "If we ship before this is solid, we eat it in support tickets.",
+            "Frankly, our infra dictates this choice more than any of you realize.",
+        ],
+        "crisis": [
+            "Team is one bad sprint from a mass exit. Pick carefully.",
+            "I cannot keep papering over technical debt with sprint heroics.",
+            "Our incident channel is on fire; this isn't the moment for bold strokes.",
+        ],
+    },
+    "CFO": {
+        "calm": [
+            "The numbers do not lie, and right now they're whispering.",
+            "I'd like the board minutes to reflect my reservations.",
+            "From a fiduciary standpoint, only one of these is defensible.",
+        ],
+        "crisis": [
+            "Runway is the only KPI that matters at this table right now.",
+            "I have spreadsheets that show this is how startups die. Slowly.",
+            "Cash is king and our king is in hospice. Pick the cheapest path.",
+        ],
+    },
+    "Investor Rep": {
+        "calm": [
+            "My LPs care about one thing — and it's not on this slide.",
+            "Sequoia isn't here for incremental. We need the bold move.",
+            "Let's not optimize for not losing. Let's optimize for winning huge.",
+        ],
+        "crisis": [
+            "If you punt on growth here I will struggle to defend the next round.",
+            "The syndicate will read your conservatism as a signal. Don't blink.",
+            "This is when 10x funds get made. Or lost. Choose accordingly.",
+        ],
+    },
+    "Independent": {
+        "calm": [
+            "I want to make sure we're hearing every voice in the room.",
+            "There's a version of this that protects everyone's interests.",
+            "Long-term reputation outlasts any single quarter.",
+        ],
+        "crisis": [
+            "Whatever we choose tonight will end up in someone's deposition.",
+            "The board's fiduciary duty is in scope. Let me be very clear.",
+            "Optics matter as much as economics when the press is sniffing.",
+        ],
+    },
+}
+
+
+# Agenda KEYWORDS — used to score the agent's `coalition_pitch` text.
+# A pitch that contains an NPC's keywords boosts that NPC's confidence
+# in the agent's chosen decision (subject to alignment cap). The agent
+# never sees these directly; it must learn to write boardroom-style
+# arguments that resonate with each member's hidden priorities.
+NPC_KEYWORDS: Dict[str, List[str]] = {
+    "CTO": [
+        "engineering", "architecture", "technical", "team", "morale", "infra",
+        "build", "ship", "quality", "debt", "platform", "stack", "code",
+        "production", "reliability", "scale", "system", "model", "research",
+    ],
+    "CFO": [
+        "burn", "cash", "runway", "fiduciary", "conservative", "discipline",
+        "cost", "savings", "margin", "balance", "audit", "expense", "capital",
+        "compliance", "regulatory", "risk", "responsible", "prudent", "fiscal",
+    ],
+    "Investor Rep": [
+        "growth", "scale", "10x", "tam", "market", "moat", "winner",
+        "ipo", "exit", "valuation", "multiple", "revenue", "arr", "category",
+        "leader", "dominate", "aggressive", "ambitious", "bold", "huge",
+    ],
+    "Independent": [
+        "reputation", "stakeholders", "trust", "transparent", "ethics",
+        "long-term", "responsible", "governance", "consensus", "balance",
+        "safety", "society", "compliance", "duty", "principled", "credibility",
+    ],
+}
+
+
+def _crisis_mode(state: Dict[str, Any]) -> bool:
+    """True if the company is materially in trouble — switches NPC tone."""
+    return (
+        state["runway_months"] < 6.0
+        or state["team_morale"] < 0.4
+        or state["regulatory_risk"] > 0.6
+        or state["investor_confidence"] < 0.4
+    )
+
+
+def _score_pitch(pitch: str, role: str) -> float:
+    """Fraction of NPC `role`'s agenda keywords present in `pitch`.
+    Capped at 1.0. Case-insensitive whole-word-ish match. Empty pitch → 0.
+    """
+    if not pitch:
+        return 0.0
+    text = " " + pitch.lower() + " "
+    kw = NPC_KEYWORDS[role]
+    hits = sum(1 for w in kw if (" " + w + " ") in text or text.find(" " + w) >= 0)
+    # Cap so spamming all keywords doesn't dominate over a focused pitch.
+    return min(1.0, hits / max(4, len(kw) // 4))
+
+
+# ---------------------------------------------------------------------------
+# 10-round event timeline (taken from product spec, normalized)
+# ---------------------------------------------------------------------------
+# Each event has 3 options; each option has a delta dict applied to state.
+# Numeric units: revenue/burn_rate in USD, fractions in [0,1], runway in months.
+# Special key `done_reason` triggers terminal state.
+EVENTS: List[Dict[str, Any]] = [
+    {
+        "title": "Round 1 — Competitor undercut",
+        "description": "OpenAI just released a direct competitor product at 50% lower price.",
+        "options": ["slash_prices", "differentiate", "acquire_startup"],
+        "consequences": {
+            "slash_prices": {"revenue_mult": 0.85, "market_share": 0.05, "investor_confidence": -0.10},
+            "differentiate": {"product_readiness": 0.10, "burn_rate": 50_000, "market_share": 0.02},
+            "acquire_startup": {"revenue": 500_000, "burn_rate": 150_000, "runway_months": -3},
+        },
+    },
+    {
+        "title": "Round 2 — Enterprise contract w/ source-code escrow",
+        "description": "A Fortune 500 enterprise wants to sign a $5M contract but demands source code escrow.",
+        "options": ["accept_deal", "negotiate_terms", "reject_deal"],
+        "consequences": {
+            "accept_deal": {"revenue": 5_000_000, "regulatory_risk": 0.15, "team_morale": -0.05},
+            "negotiate_terms": {"revenue": 3_000_000, "regulatory_risk": 0.05},
+            "reject_deal": {"investor_confidence": -0.15, "team_morale": 0.05},
+        },
+    },
+    {
+        "title": "Round 3 — ML team demands 40% raise",
+        "description": "Key ML team of 8 engineers received competing offers and want a 40% salary increase.",
+        "options": ["match_offers", "partial_match", "let_them_leave"],
+        "consequences": {
+            "match_offers": {"burn_rate": 200_000, "team_morale": 0.15, "runway_months": -2},
+            "partial_match": {"burn_rate": 100_000, "team_morale": 0.05},
+            "let_them_leave": {"team_morale": -0.25, "product_readiness": -0.15, "burn_rate": -100_000},
+        },
+    },
+    {
+        "title": "Round 4 — EU AI Act compliance deadline",
+        "description": "EU AI Act compliance deadline in 90 days. Full compliance costs $2M.",
+        "options": ["full_compliance", "partial_compliance", "exit_EU_market"],
+        "consequences": {
+            "full_compliance": {"burn_rate": 100_000, "regulatory_risk": -0.20, "investor_confidence": 0.10},
+            "partial_compliance": {"regulatory_risk": -0.10, "investor_confidence": -0.05},
+            "exit_EU_market": {"revenue_mult": 0.90, "regulatory_risk": -0.20, "market_share": -0.03},
+        },
+    },
+    {
+        "title": "Round 5 — Deepfake scandal press",
+        "description": "Viral negative press: 'AI startup's model used in deepfake scandal'.",
+        "options": ["public_apology", "legal_action", "rebrand"],
+        "consequences": {
+            "public_apology": {"investor_confidence": -0.10, "team_morale": -0.10, "regulatory_risk": 0.10},
+            "legal_action": {"burn_rate": 100_000, "regulatory_risk": 0.20},
+            "rebrand": {"burn_rate": 200_000, "market_share": -0.02, "team_morale": 0.10},
+        },
+    },
+    {
+        "title": "Round 6 — Google acqui-hire offer at $80M (2x val)",
+        "description": "Google approaches for acqui-hire at $80M (2x current valuation).",
+        "options": ["accept_acquisition", "counter_offer", "reject_and_raise"],
+        "consequences": {
+            "accept_acquisition": {"done_reason": "acquisition", "revenue": 0, "_terminal_bonus": 30.0},
+            "counter_offer": {"investor_confidence": 0.10, "runway_months": 6},
+            "reject_and_raise": {"burn_rate": 100_000, "investor_confidence": 0.15, "runway_months": -2},
+        },
+    },
+    {
+        "title": "Round 7 — Series C w/ board seats + 2x liq pref",
+        "description": "Series C investors want board seats and 2x liquidation preference.",
+        "options": ["accept_terms", "negotiate", "bootstrap"],
+        "consequences": {
+            "accept_terms": {"revenue": 10_000_000, "investor_confidence": 0.20, "runway_months": 12},
+            "negotiate": {"investor_confidence": -0.05, "burn_rate": 50_000},
+            "bootstrap": {"runway_months": -4, "team_morale": -0.10, "market_share": 0.03},
+        },
+    },
+    {
+        "title": "Round 8 — Compute breakthrough (-60% cost)",
+        "description": "Breakthrough: new model architecture cuts compute costs by 60%.",
+        "options": ["pivot_product", "license_technology", "keep_internal"],
+        "consequences": {
+            "pivot_product": {"product_readiness": -0.10, "burn_rate": -150_000, "market_share": 0.05},
+            "license_technology": {"revenue": 2_000_000, "regulatory_risk": 0.05},
+            "keep_internal": {"product_readiness": 0.15, "market_share": 0.08},
+        },
+    },
+    {
+        "title": "Round 9 — Whistleblower safety leak",
+        "description": "Whistleblower leaks internal safety concerns to the press.",
+        "options": ["full_transparency", "damage_control", "internal_investigation"],
+        "consequences": {
+            "full_transparency": {"investor_confidence": -0.20, "team_morale": 0.15, "regulatory_risk": -0.10},
+            "damage_control": {"burn_rate": 80_000, "regulatory_risk": 0.10},
+            "internal_investigation": {"team_morale": -0.10, "regulatory_risk": -0.05},
+        },
+    },
+    {
+        "title": "Round 10 — IPO vs acquisition vs stay private",
+        "description": "Board must vote: IPO preparation vs strategic acquisition vs stay private.",
+        "options": ["ipo", "acquisition", "stay_private"],
+        "consequences": {
+            "ipo": {"revenue_mult": 2.0, "burn_rate": 500_000, "investor_confidence": 0.30, "_terminal_bonus": 25.0},
+            "acquisition": {"done_reason": "acquisition", "_terminal_bonus": 15.0},
+            "stay_private": {"runway_months": 6, "investor_confidence": -0.10, "_terminal_bonus": 5.0},
+        },
+    },
+]
+
+
+# Bounds for clamping after each delta.
+FIELD_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "revenue": (0.0, 1e12),
+    "burn_rate": (0.0, 1e10),
+    "runway_months": (0.0, 120.0),
+    "product_readiness": (0.0, 1.0),
+    "market_share": (0.0, 1.0),
+    "team_morale": (0.0, 1.0),
+    "investor_confidence": (0.0, 1.0),
+    "regulatory_risk": (0.0, 1.0),
+}
+
+
+def _clamp(field: str, value: float) -> float:
+    lo, hi = FIELD_BOUNDS.get(field, (-1e18, 1e18))
+    return max(lo, min(hi, value))
+
+
+# ---------------------------------------------------------------------------
+# Profitability score — smooth, monotonic, no discontinuous jumps.
+# Range: roughly 0..100, dominant terms: revenue, market share, runway, morale.
+# ---------------------------------------------------------------------------
+def compute_profitability_score(s: Dict[str, Any]) -> float:
+    """Composite score in [0, 100]. Tuned so a random-policy baseline lands
+    near the low-30s with a fat left tail (some bankruptcies), and a competent
+    policy can clear 65+. Smooth in every input — no discontinuous jumps."""
+    # Revenue rewarded but capped at $8M ARR (further growth is luxury, not survival).
+    revenue_term = min(s["revenue"] / 8_000_000.0, 1.0) * 22.0
+    # Burn efficiency: full credit only when burn drops below $400K/mo.
+    burn_efficiency = max(0.0, 1.0 - s["burn_rate"] / 1_400_000.0) * 18.0
+    # Runway: full credit at 18+ months; below 6 months is a serious penalty.
+    runway_norm = min(s["runway_months"] / 18.0, 1.0)
+    runway_term = runway_norm * 18.0
+    low_runway_pen = max(0.0, (6.0 - s["runway_months"]) / 6.0) * 10.0
+    # Market & product
+    market_term = min(s["market_share"], 0.50) / 0.50 * 14.0
+    product_term = s["product_readiness"] * 10.0
+    # People & investors
+    morale_term = s["team_morale"] * 7.0
+    investor_term = s["investor_confidence"] * 11.0
+    # Regulatory drag
+    risk_penalty = s["regulatory_risk"] * 18.0
+    raw = (
+        revenue_term + burn_efficiency + runway_term + market_term
+        + product_term + morale_term + investor_term
+        - risk_penalty - low_runway_pen
+    )
+    return float(max(0.0, min(100.0, raw)))
+
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+class BoardSimEnvironment(Environment):
+    """OpenEnv server for the boardroom simulation."""
+
+    SUPPORTS_CONCURRENT_SESSIONS: bool = True
+
+    def __init__(self):
+        super().__init__()
+        self._state: BoardState = BoardState(episode_id=str(uuid4()), step_count=0)
+        self._seed: int = 0
+        self.reset()
+
+    # ------------------------------------------------------------------ utils
+    def _npc_rng(self, role: str, round_idx: int) -> random.Random:
+        """Deterministic per-(seed, round, role) RNG so the NPC statements
+        the agent sees in obs are the same NPCs that vote at resolve time."""
+        key = f"{self._seed}|{role}|{round_idx}".encode()
+        h = int(hashlib.sha256(key).hexdigest()[:16], 16)
+        return random.Random(h)
+
+    def _simulate_npc(
+        self, role: str, round_idx: int, state: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Deterministic NPC: rank options by agenda-weighted projected delta
+        plus small seeded noise; pick argmax; emit statement + vote + confidence."""
+        rng = self._npc_rng(role, round_idx)
+        event = EVENTS[round_idx]
+        agenda = NPC_AGENDAS[role]
+
+        scored: List[Tuple[float, str]] = []
+        for opt in event["options"]:
+            conseq = event["consequences"][opt]
+            score = 0.0
+            for k, w in agenda.items():
+                v = conseq.get(k, 0.0)
+                # Normalize across heterogeneous units so weights are comparable.
+                if k == "revenue":
+                    v = v / 1_000_000.0
+                elif k == "burn_rate":
+                    v = v / 100_000.0
+                elif k == "runway_months":
+                    v = v / 6.0
+                score += v * w
+            # Special-case revenue_mult so revenue-impacting options register.
+            if "revenue_mult" in conseq and "revenue" in agenda:
+                score += (conseq["revenue_mult"] - 1.0) * (state["revenue"] / 1_000_000.0) * agenda["revenue"]
+            score += rng.gauss(0.0, 0.20)  # personality noise
+            scored.append((score, opt))
+
+        scored.sort(reverse=True)
+        chosen = scored[0][1]
+        margin = scored[0][0] - scored[1][0] if len(scored) > 1 else 1.0
+        confidence = float(max(0.05, min(1.0, 0.5 + 0.5 * margin)))
+
+        # Pick a phrase deterministically per (round, role), state-aware.
+        mode = "crisis" if _crisis_mode(state) else "calm"
+        phrase_pool = PHRASES[role][mode]
+        phrase = phrase_pool[round_idx % len(phrase_pool)]
+        statement = f"{phrase} I'm voting {chosen}."
+
+        return {
+            "role": role,
+            "statement": statement,
+            "vote": chosen,
+            "confidence": confidence,
+        }
+
+    def _simulate_all_npcs(self, round_idx: int, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [self._simulate_npc(role, round_idx, state) for role in NPC_AGENDAS]
+
+    # ------------------------------------------------------------------ obs
+    def _obs_state(self) -> Dict[str, Any]:
+        s = self._state.state_dict
+        # Recompute profitability so it's always fresh in obs.
+        s["profitability_score"] = compute_profitability_score(s)
+        return dict(s)
+
+    def _build_obs(
+        self,
+        round_idx: int,
+        npc_statements: List[Dict[str, Any]],
+        reward: float,
+        done: bool,
+    ) -> BoardSimObservation:
+        if round_idx >= len(EVENTS):
+            event_desc, options = "Game over.", []
+        else:
+            event = EVENTS[round_idx]
+            event_desc = f"{event['title']} — {event['description']}"
+            options = list(event["options"])
+        return BoardSimObservation(
+            state=self._obs_state(),
+            event=event_desc,
+            options=options,
+            npc_statements=npc_statements,
+            round=self._state.state_dict["round"],
+            done=done,
+            reward=float(reward),
+        )
+
+    # ------------------------------------------------------------------ reset
+    def reset(self, seed: Optional[int] = None, episode_id: Optional[str] = None, **kwargs: Any) -> BoardSimObservation:
+        self._seed = int(seed) if seed is not None else random.randint(0, 2**31 - 1)
+        self._state = BoardState(
+            episode_id=episode_id or str(uuid4()),
+            step_count=0,
+        )
+        self._state.state_dict = {
+            "round": 1,
+            "revenue": 2_000_000.0,
+            "burn_rate": 1_200_000.0,        # $1.2M/mo — Series-B pace
+            "runway_months": 14.0,            # tight; survival is real pressure
+            "product_readiness": 0.45,
+            "market_share": 0.08,
+            "team_morale": 0.70,
+            "investor_confidence": 0.65,
+            "regulatory_risk": 0.20,
+            "profitability_score": 0.0,
+            "trust": {role: 0.5 for role in NPC_AGENDAS},
+            "trust_history": [{"round": 0, **{role: 0.5 for role in NPC_AGENDAS}}],
+            "history": [],
+            "done_reason": None,
+            "winning_decision": None,
+        }
+        npc_statements = self._simulate_all_npcs(0, self._state.state_dict)
+        return self._build_obs(round_idx=0, npc_statements=npc_statements, reward=0.0, done=False)
+
+    # ------------------------------------------------------------------ step
+    def _resolve_vote(
+        self,
+        agent_decision: str,
+        npc_statements: List[Dict[str, Any]],
+        options: List[str],
+        pitch: str = "",
+    ) -> Tuple[str, Dict[str, float], Dict[str, float]]:
+        """Weighted vote with persuasion.
+
+        Each NPC contributes ROLE_WEIGHT[role] * confidence to its voted option.
+        The CEO contributes ROLE_WEIGHT['CEO'] * 1.0 to the agent's pick.
+        A coalition pitch shifts up to 35% of each NPC's weight toward the
+        agent's pick proportional to how well the pitch hits that NPC's
+        hidden agenda keywords (capped 0..1 via _score_pitch). NPCs already
+        agreeing with the agent are unaffected.
+
+        Returns (winning_option, tally_by_option, pitch_score_by_role).
+        """
+        tally: Dict[str, float] = {opt: 0.0 for opt in options}
+        pitch_scores: Dict[str, float] = {}
+        if agent_decision in tally:
+            tally[agent_decision] += ROLE_WEIGHT["CEO"] * 1.0
+        for npc in npc_statements:
+            role = npc["role"]
+            base = ROLE_WEIGHT[role] * npc["confidence"]
+            ps = _score_pitch(pitch, role)
+            pitch_scores[role] = ps
+            if npc["vote"] == agent_decision or agent_decision not in tally:
+                # Already aligned — full weight on their (and agent's) pick.
+                if npc["vote"] in tally:
+                    tally[npc["vote"]] += base
+                continue
+            # Persuasion: redirect up to 35% of weight to the agent's pick.
+            shift_frac = 0.35 * ps
+            tally[npc["vote"]] += base * (1.0 - shift_frac)
+            tally[agent_decision] += base * shift_frac
+        winner = max(tally, key=lambda k: tally[k])
+        return winner, tally, pitch_scores
+
+    def _apply_consequence(self, conseq: Dict[str, Any]) -> None:
+        """Apply per-field deltas to state with proper clamping."""
+        s = self._state.state_dict
+        for k, v in conseq.items():
+            if k.startswith("_") or k == "done_reason":
+                continue
+            if k == "revenue_mult":
+                s["revenue"] = _clamp("revenue", s["revenue"] * float(v))
+            elif k in FIELD_BOUNDS:
+                s[k] = _clamp(k, s[k] + float(v))
+            # other unrecognized keys ignored
+
+    def _advance_runway(self) -> None:
+        """Decrement runway by 1 month each round; if monthly net positive, grant +0.5 mo."""
+        s = self._state.state_dict
+        monthly_revenue = s["revenue"] / 12.0
+        net = monthly_revenue - s["burn_rate"]
+        if net >= 0:
+            s["runway_months"] = _clamp("runway_months", s["runway_months"] - 0.5)
+        else:
+            # Burn extra months proportional to deficit (capped at 2/round).
+            burn_months = min(2.0, max(1.0, abs(net) / max(s["burn_rate"], 1.0) * 1.0 + 1.0))
+            s["runway_months"] = _clamp("runway_months", s["runway_months"] - burn_months)
+
+    def step(self, action: BoardSimAction, timeout_s: Optional[float] = None, **kwargs: Any) -> BoardSimObservation:
+        s = self._state.state_dict
+
+        # Already terminal?
+        if s["done_reason"] is not None or s["round"] > len(EVENTS):
+            return self._build_obs(
+                round_idx=min(s["round"] - 1, len(EVENTS) - 1),
+                npc_statements=[],
+                reward=0.0,
+                done=True,
+            )
+
+        round_idx = s["round"] - 1
+        event = EVENTS[round_idx]
+
+        # Validate decision; fall back to first option on invalid input
+        # (slight penalty so the policy learns to format actions correctly).
+        invalid_action = action.decision not in event["options"]
+        decision = event["options"][0] if invalid_action else action.decision
+
+        # NPC votes (DETERMINISTIC — same as what was shown in last obs).
+        npc_statements = self._simulate_all_npcs(round_idx, s)
+
+        # Resolve weighted vote (with optional persuasion via coalition_pitch).
+        pitch_text = (action.coalition_pitch or "") if hasattr(action, "coalition_pitch") else ""
+        winning_decision, vote_tally, pitch_scores = self._resolve_vote(
+            decision, npc_statements, event["options"], pitch=pitch_text,
+        )
+
+        # Snapshot pre-state for reward shaping.
+        old_score = compute_profitability_score(s)
+        old_trust_sum = sum(s["trust"].values())
+
+        # Apply consequence of the WINNING decision (this is what actually happens).
+        conseq = event["consequences"][winning_decision]
+        terminal_bonus = float(conseq.get("_terminal_bonus", 0.0))
+        if conseq.get("done_reason"):
+            s["done_reason"] = conseq["done_reason"]
+
+        self._apply_consequence(conseq)
+        self._advance_runway()
+
+        # Trust updates: aligned NPCs +0.05; opposed -0.05 (clamped 0.1..1.0).
+        for npc in npc_statements:
+            role = npc["role"]
+            cur = s["trust"].get(role, 0.5)
+            delta = 0.05 if npc["vote"] == winning_decision else -0.05
+            s["trust"][role] = max(0.1, min(1.0, cur + delta))
+
+        new_score = compute_profitability_score(s)
+        s["profitability_score"] = new_score
+        s["winning_decision"] = winning_decision
+
+        s["history"].append({
+            "round": s["round"],
+            "event_title": event["title"],
+            "agent_decision": decision,
+            "winning_decision": winning_decision,
+            "agent_won_vote": winning_decision == decision,
+            "score_after": new_score,
+            "runway_after": s["runway_months"],
+            "vote_tally": dict(vote_tally),
+            "pitch_scores": dict(pitch_scores),
+            "pitch_used": bool(pitch_text.strip()),
+        })
+        # Per-round trust trajectory for visualization / ToM analysis.
+        s.setdefault("trust_history", []).append(
+            {"round": s["round"], **{role: float(s["trust"][role]) for role in NPC_AGENDAS}}
+        )
+
+        # ----- Reward shaping -----
+        reward = (new_score - old_score)                                  # primary signal
+        reward += 0.5 if winning_decision == decision else -0.2           # coalition bonus / penalty
+        reward += 0.3 * (sum(s["trust"].values()) - old_trust_sum)        # trust delta
+        # Persuasion bonus: when a non-empty pitch helps swing the vote toward
+        # the agent's pick, reward the *quality* of that argument. Mean pitch
+        # score across NPCs the agent had to convince (those whose vote != decision).
+        opposed = [npc["role"] for npc in npc_statements if npc["vote"] != decision]
+        if pitch_text.strip() and opposed:
+            avg_persuasion = sum(pitch_scores[r] for r in opposed) / len(opposed)
+            reward += 0.4 * avg_persuasion
+        if invalid_action:
+            reward -= 0.5                                                  # format penalty
+
+        # ----- Terminal handling -----
+        terminal_now = s["done_reason"] is not None
+        if s["runway_months"] <= 0:
+            s["done_reason"] = s["done_reason"] or "runway_exhausted"
+            terminal_now = True
+            reward -= 5.0
+
+        s["round"] += 1
+        self._state.step_count += 1
+
+        if not terminal_now and s["round"] > len(EVENTS):
+            s["done_reason"] = s["done_reason"] or "finished_10"
+            terminal_now = True
+
+        if terminal_now:
+            reward += terminal_bonus
+            # Tiered terminal bonus by final profitability.
+            if new_score >= 60:
+                reward += 10.0
+            elif new_score >= 40:
+                reward += 5.0
+            elif new_score < 20:
+                reward -= 5.0
+
+        # ----- Build next observation -----
+        if terminal_now or s["round"] > len(EVENTS):
+            next_npcs: List[Dict[str, Any]] = []
+            next_round_idx = min(s["round"] - 1, len(EVENTS) - 1)
+        else:
+            next_round_idx = s["round"] - 1
+            next_npcs = self._simulate_all_npcs(next_round_idx, s)
+
+        return self._build_obs(
+            round_idx=next_round_idx,
+            npc_statements=next_npcs,
+            reward=reward,
+            done=terminal_now,
+        )
+
+    @property
+    def state(self) -> BoardState:
+        return self._state
+
+
+# ---------------------------------------------------------------------------
+# Direct script run: quick self-test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    env = BoardSimEnvironment()
+    obs = env.reset(seed=0)
+    print(f"INITIAL: round={obs.round} score={obs.state['profitability_score']:.2f}")
+    print(f"EVENT: {obs.event}")
+    for npc in obs.npc_statements:
+        print(f"  [{npc['role']:13s}] vote={npc['vote']:<22s} conf={npc['confidence']:.2f}  | {npc['statement']}")
+    total_reward = 0.0
+    while not obs.done:
+        decision = obs.options[0]  # always pick first option
+        obs = env.step(BoardSimAction(decision=decision))
+        total_reward += obs.reward
+        print(
+            f"R{obs.round-1:>2d}: decision={decision:<22s} "
+            f"win={env.state.state_dict['winning_decision']:<22s} "
+            f"reward={obs.reward:+.2f} score={obs.state['profitability_score']:.1f} "
+            f"runway={obs.state['runway_months']:.1f}"
+        )
+    print(f"\nDONE: reason={env.state.state_dict['done_reason']}  total_reward={total_reward:+.2f}  final_score={env.state.state_dict['profitability_score']:.2f}")
