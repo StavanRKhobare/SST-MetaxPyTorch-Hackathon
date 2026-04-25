@@ -111,7 +111,7 @@ Three design properties push it past a "pick-an-action" toy:
 
 3. **Events are shuffled and consequence-noised per episode.** The agent cannot memorize "round 1 = always pick differentiate." Each seed produces a different event order and ±15% magnitude variation on consequences, forcing genuine policy generalization.
 
-**Random policy baseline** (200 episodes, real measurement): mean profitability **40.2 ± 16.5**, survival rate **87.5%**, zero pitch usage. A trained policy has a clear structural advantage through the pitch channel that a random policy cannot exploit.
+**Random policy baseline** (200 episodes, real measurement): mean profitability **45.7 ± 13.1**, survival rate **94.5%**, zero pitch usage. A trained policy has a clear structural advantage through the pitch channel that a random policy cannot exploit.
 
 ---
 
@@ -200,17 +200,17 @@ This is a *good* round even though profitability slightly dipped — the agent w
 **Random baseline** (200 episodes, real measurement from `assets/baseline.csv`):
 
 ```
-Mean final profitability:  40.24  (std 16.51)
-Mean episode reward:       29.71
-Survival rate:             87.5%
+Mean final profitability:  45.72  (std 13.13)
+Mean episode reward:       18.27
+Survival rate:             94.5%
 Pitch usage rate:          0%     (random policy never writes pitches)
 ```
 
 | Metric | Random | Trained Qwen3-0.6B |
 |---|---|---|
-| Final profitability | 40.24 ± 16.51 | TBD — target ≥ 65 |
-| Survival rate | 87.5% | TBD — target ≥ 98% |
-| Episode reward | 29.71 | TBD |
+| Final profitability | 45.72 ± 13.13 | TBD — target ≥ 65 |
+| Survival rate | 94.5% | TBD — target ≥ 98% |
+| Episode reward | 18.27 | TBD |
 | ToM probe (predict opposing NPC) | 25% | TBD — target ≥ 60% |
 | Pitch usage rate | 0% | TBD |
 | Invalid action rate | n/a | TBD — track via §9b logging |
@@ -219,7 +219,7 @@ Pitch usage rate:          0%     (random policy never writes pitches)
 
 ![Training reward curve](assets/reward_curve.png)
 
-*The curve is expected to cross the random baseline (~29.7) around step 80 as the model learns to write non-empty pitches, with a second inflection when coalition-win rate stabilizes. Replace with actual W&B export after training.*
+*The curve is expected to cross the random baseline (~18.3) around step 80 as the model learns to write non-empty pitches, with a second inflection when coalition-win rate stabilizes. Replace with actual W&B export after training.*
 
 **Profitability distribution — random vs trained** (PRELIMINARY):
 

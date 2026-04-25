@@ -75,7 +75,7 @@ raw =
 
 **Initial state score** (with default init values) ≈ 37.3/100.  
 **Theoretical maximum** = 22 + 18 + 18 + 0 + 14 + 10 + 7 + 11 − 0 = **100**.  
-**Random policy** lands near 30–50 with a left tail around 10–20 (bankruptcy episodes).
+**Random policy** lands near 30–55 with mean ≈ 45.7 (measured over 200 episodes after §9.5 reward tweaks).
 
 ---
 
