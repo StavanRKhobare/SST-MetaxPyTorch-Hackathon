@@ -1,3 +1,18 @@
+---
+title: NeuralEdge AI Boardroom
+emoji: 🏛️
+colorFrom: indigo
+colorTo: pink
+sdk: docker
+app_port: 8000
+pinned: false
+tags:
+  - openenv
+  - multi-agent
+  - reinforcement-learning
+  - hackathon
+---
+
 # NeuralEdge AI Boardroom — Multi-Agent OpenEnv Submission
 
 > A Series-B AI startup CEO-simulator where the agent must build winning coalitions among 4 hidden-agenda board members across 10 rounds of market crises to maximize profitability and survive.
