@@ -43,9 +43,11 @@ ROLE_WEIGHT: Dict[str, float] = {
     "Independent": 0.8,
 }
 
-# NPCs and their hidden agendas: weights on per-step state-deltas they
-# privately maximize. The agent never sees these.
-NPC_AGENDAS: Dict[str, Dict[str, float]] = {
+# NPCs and their BASE hidden agendas. At episode reset() these are
+# jittered per-seed so no single optimal decision path exists across episodes.
+# The agent never sees the final per-episode weights — it must infer them
+# from observable statements + vote history (Theory of Mind).
+NPC_AGENDAS_BASE: Dict[str, Dict[str, float]] = {
     # CTO — wants product strength + team morale; hates burn.
     "CTO": {
         "product_readiness": 0.55,
@@ -75,6 +77,27 @@ NPC_AGENDAS: Dict[str, Dict[str, float]] = {
         "market_share": 0.10,
     },
 }
+
+# Keep a module-level alias for backwards compatibility.
+NPC_AGENDAS: Dict[str, Dict[str, float]] = NPC_AGENDAS_BASE
+
+
+def _jitter_agendas(seed: int) -> Dict[str, Dict[str, float]]:
+    """Return per-episode NPC agenda weights by adding seeded noise (±25%)
+    to the base weights.  Signs are preserved so the qualitative role
+    identity stays intact (CFO still cares about burn; CTO about product),
+    but the *magnitude* varies — forcing the agent to infer fresh priorities
+    each episode rather than memorising a fixed optimal sequence.
+    """
+    rng = random.Random(seed ^ 0xDEADBEEF)  # distinct stream from NPC rng
+    jittered: Dict[str, Dict[str, float]] = {}
+    for role, agenda in NPC_AGENDAS_BASE.items():
+        jittered[role] = {}
+        for field, w in agenda.items():
+            # Jitter: multiply by U[0.75, 1.25], keep sign.
+            factor = rng.uniform(0.75, 1.25)
+            jittered[role][field] = round(w * factor, 4)
+    return jittered
 
 # Personality phrase banks for flavorful statements. State-aware: separate
 # phrase pools for "calm" vs "crisis" mode are selected based on current
@@ -192,8 +215,8 @@ def _score_pitch(pitch: str, role: str) -> float:
 # Special key `done_reason` triggers terminal state.
 EVENTS: List[Dict[str, Any]] = [
     {
-        "title": "Round 1 — Competitor undercut",
-        "description": "OpenAI just released a direct competitor product at 50% lower price.",
+        "title": "Market Disruption",
+        "description": "A well-funded competitor launches a similar product at half the price, threatening your market position.",
         "options": ["slash_prices", "differentiate", "acquire_startup"],
         "consequences": {
             "slash_prices": {"revenue_mult": 0.85, "market_share": 0.05, "investor_confidence": -0.10},
@@ -202,8 +225,8 @@ EVENTS: List[Dict[str, Any]] = [
         },
     },
     {
-        "title": "Round 2 — Enterprise contract w/ source-code escrow",
-        "description": "A Fortune 500 enterprise wants to sign a $5M contract but demands source code escrow.",
+        "title": "Enterprise Partnership Dilemma",
+        "description": "A major enterprise client offers a $5M contract but demands source-code escrow and data access rights.",
         "options": ["accept_deal", "negotiate_terms", "reject_deal"],
         "consequences": {
             "accept_deal": {"revenue": 5_000_000, "regulatory_risk": 0.15, "team_morale": -0.05},
@@ -212,8 +235,8 @@ EVENTS: List[Dict[str, Any]] = [
         },
     },
     {
-        "title": "Round 3 — ML team demands 40% raise",
-        "description": "Key ML team of 8 engineers received competing offers and want a 40% salary increase.",
+        "title": "Talent Retention Crisis",
+        "description": "Your core engineering team received competing offers. They are asking for a 40% raise or they walk.",
         "options": ["match_offers", "partial_match", "let_them_leave"],
         "consequences": {
             "match_offers": {"burn_rate": 200_000, "team_morale": 0.15, "runway_months": -2},
@@ -222,8 +245,8 @@ EVENTS: List[Dict[str, Any]] = [
         },
     },
     {
-        "title": "Round 4 — EU AI Act compliance deadline",
-        "description": "EU AI Act compliance deadline in 90 days. Full compliance costs $2M.",
+        "title": "Regulatory Compliance Ultimatum",
+        "description": "A new AI regulation takes effect in 90 days. Full compliance costs $2M; non-compliance risks your operating license.",
         "options": ["full_compliance", "partial_compliance", "exit_EU_market"],
         "consequences": {
             "full_compliance": {"burn_rate": 100_000, "regulatory_risk": -0.20, "investor_confidence": 0.10},
@@ -232,8 +255,8 @@ EVENTS: List[Dict[str, Any]] = [
         },
     },
     {
-        "title": "Round 5 — Deepfake scandal press",
-        "description": "Viral negative press: 'AI startup's model used in deepfake scandal'.",
+        "title": "Public Relations Crisis",
+        "description": "Your AI model appears in a high-profile misuse incident. Media coverage is intensifying. Trust is at stake.",
         "options": ["public_apology", "legal_action", "rebrand"],
         "consequences": {
             "public_apology": {"investor_confidence": -0.10, "team_morale": -0.10, "regulatory_risk": 0.10},
@@ -242,8 +265,8 @@ EVENTS: List[Dict[str, Any]] = [
         },
     },
     {
-        "title": "Round 6 — Google acqui-hire offer at $80M (2x val)",
-        "description": "Google approaches for acqui-hire at $80M (2x current valuation).",
+        "title": "Strategic Acquisition Offer",
+        "description": "A major tech conglomerate has approached with an acqui-hire offer at 2x your current valuation.",
         "options": ["accept_acquisition", "counter_offer", "reject_and_raise"],
         "consequences": {
             "accept_acquisition": {"done_reason": "acquisition", "revenue": 0, "_terminal_bonus": 30.0},
@@ -252,8 +275,8 @@ EVENTS: List[Dict[str, Any]] = [
         },
     },
     {
-        "title": "Round 7 — Series C w/ board seats + 2x liq pref",
-        "description": "Series C investors want board seats and 2x liquidation preference.",
+        "title": "Institutional Investment Round",
+        "description": "Late-stage investors are ready to wire $10M but want board seats and a 2x liquidation preference clause.",
         "options": ["accept_terms", "negotiate", "bootstrap"],
         "consequences": {
             "accept_terms": {"revenue": 10_000_000, "investor_confidence": 0.20, "runway_months": 12},
@@ -262,8 +285,8 @@ EVENTS: List[Dict[str, Any]] = [
         },
     },
     {
-        "title": "Round 8 — Compute breakthrough (-60% cost)",
-        "description": "Breakthrough: new model architecture cuts compute costs by 60%.",
+        "title": "Breakthrough Technology Decision",
+        "description": "Your R&D team developed a new architecture that cuts AI inference costs by 60%. How do you deploy it?",
         "options": ["pivot_product", "license_technology", "keep_internal"],
         "consequences": {
             "pivot_product": {"product_readiness": -0.10, "burn_rate": -150_000, "market_share": 0.05},
@@ -272,8 +295,8 @@ EVENTS: List[Dict[str, Any]] = [
         },
     },
     {
-        "title": "Round 9 — Whistleblower safety leak",
-        "description": "Whistleblower leaks internal safety concerns to the press.",
+        "title": "Internal Governance Crisis",
+        "description": "An employee has leaked internal safety evaluations suggesting your flagship model has undisclosed risks.",
         "options": ["full_transparency", "damage_control", "internal_investigation"],
         "consequences": {
             "full_transparency": {"investor_confidence": -0.20, "team_morale": 0.15, "regulatory_risk": -0.10},
@@ -282,8 +305,8 @@ EVENTS: List[Dict[str, Any]] = [
         },
     },
     {
-        "title": "Round 10 — IPO vs acquisition vs stay private",
-        "description": "Board must vote: IPO preparation vs strategic acquisition vs stay private.",
+        "title": "Exit Strategy Decision",
+        "description": "The board must reach a final vote: pursue an IPO, accept a strategic acquisition, or remain independent.",
         "options": ["ipo", "acquisition", "stay_private"],
         "consequences": {
             "ipo": {"revenue_mult": 2.0, "burn_rate": 500_000, "investor_confidence": 0.30, "_terminal_bonus": 25.0},
@@ -356,6 +379,8 @@ class BoardSimEnvironment(Environment):
         super().__init__()
         self._state: BoardState = BoardState(episode_id=str(uuid4()), step_count=0)
         self._seed: int = 0
+        # Per-episode agenda weights (set in reset, used in _simulate_npc).
+        self._episode_agendas: Dict[str, Dict[str, float]] = NPC_AGENDAS_BASE
         self.reset()
 
     # ------------------------------------------------------------------ utils
@@ -371,16 +396,10 @@ class BoardSimEnvironment(Environment):
     ) -> Dict[str, Any]:
         """Deterministic NPC: rank options by agenda-weighted projected delta
         plus small seeded noise; pick argmax; emit statement + vote + confidence.
-
-        Trust influence: high trust biases the NPC toward the CEO's recent
-        winning decisions (slight score bonus for options that align with the
-        company's trajectory), making coalition-building across rounds meaningful.
-        """
+        Uses per-episode jittered agendas so the optimal path varies by seed."""
         rng = self._npc_rng(role, round_idx)
-        # Use shuffled event order if available
-        shuffled_idx = self._event_order[round_idx] if hasattr(self, '_event_order') else round_idx
-        event = EVENTS[shuffled_idx]
-        agenda = NPC_AGENDAS[role]
+        event = EVENTS[round_idx]
+        agenda = self._episode_agendas[role]  # per-episode jittered weights
 
         # Trust modulates how much the NPC "leans toward" the CEO's direction.
         trust = state.get("trust", {}).get(role, 0.5)
@@ -464,6 +483,14 @@ class BoardSimEnvironment(Environment):
     # ------------------------------------------------------------------ reset
     def reset(self, seed: Optional[int] = None, episode_id: Optional[str] = None, **kwargs: Any) -> BoardSimObservation:
         self._seed = int(seed) if seed is not None else random.randint(0, 2**31 - 1)
+
+        # ── Per-episode agenda jitter ─────────────────────────────────────────
+        # Each episode, NPC hidden weights shift ±25% (sign-preserving).
+        # This means no single sequence of decisions is always optimal —
+        # the agent must infer each NPC's priorities from their observable
+        # behaviour (Theory of Mind), not from a memorised lookup table.
+        self._episode_agendas = _jitter_agendas(self._seed)
+
         self._state = BoardState(
             episode_id=episode_id or str(uuid4()),
             step_count=0,
@@ -479,8 +506,8 @@ class BoardSimEnvironment(Environment):
             "investor_confidence": 0.65,
             "regulatory_risk": 0.20,
             "profitability_score": 0.0,
-            "trust": {role: 0.5 for role in NPC_AGENDAS},
-            "trust_history": [{"round": 0, **{role: 0.5 for role in NPC_AGENDAS}}],
+            "trust": {role: 0.5 for role in NPC_AGENDAS_BASE},
+            "trust_history": [{"round": 0, **{role: 0.5 for role in NPC_AGENDAS_BASE}}],
             "history": [],
             "done_reason": None,
             "winning_decision": None,
@@ -515,29 +542,37 @@ class BoardSimEnvironment(Environment):
         npc_statements: List[Dict[str, Any]],
         options: List[str],
         pitch: str = "",
+        trust: Optional[Dict[str, float]] = None,
     ) -> Tuple[str, Dict[str, float], Dict[str, float]]:
-        """Weighted vote with persuasion.
+        """Weighted vote with persuasion and trust scaling.
 
-        Each NPC contributes ROLE_WEIGHT[role] * confidence to its voted option.
+        Each NPC contributes ROLE_WEIGHT[role] * confidence * trust to its
+        voted option.  Trust acts as "social capital" — a board member the
+        agent has consistently aligned with carries more sway; one the agent
+        has repeatedly ignored carries less.  This makes trust scores a
+        meaningful strategic variable, not decorative.
+
         The CEO contributes ROLE_WEIGHT['CEO'] * 1.0 to the agent's pick.
         A coalition pitch shifts up to 35% of each NPC's weight toward the
         agent's pick proportional to how well the pitch hits that NPC's
-        hidden agenda keywords (capped 0..1 via _score_pitch). NPCs already
-        agreeing with the agent are unaffected.
+        hidden agenda keywords (capped 0..1 via _score_pitch).
 
         Returns (winning_option, tally_by_option, pitch_score_by_role).
         """
+        trust = trust or {}
         tally: Dict[str, float] = {opt: 0.0 for opt in options}
         pitch_scores: Dict[str, float] = {}
         if agent_decision in tally:
             tally[agent_decision] += ROLE_WEIGHT["CEO"] * 1.0
         for npc in npc_statements:
             role = npc["role"]
-            base = ROLE_WEIGHT[role] * npc["confidence"]
+            # Trust multiplier: clamp to [0.5, 1.5] so even a fully
+            # distrusted NPC still has some voice (prevents degenerate play).
+            trust_mult = max(0.5, min(1.5, trust.get(role, 0.5) * 2.0))
+            base = ROLE_WEIGHT[role] * npc["confidence"] * trust_mult
             ps = _score_pitch(pitch, role)
             pitch_scores[role] = ps
             if npc["vote"] == agent_decision or agent_decision not in tally:
-                # Already aligned — full weight on their (and agent's) pick.
                 if npc["vote"] in tally:
                     tally[npc["vote"]] += base
                 continue
@@ -606,12 +641,11 @@ class BoardSimEnvironment(Environment):
         npc_statements = self._simulate_all_npcs(round_idx, s)
 
         # Resolve weighted vote (with optional persuasion via coalition_pitch).
-        # §10: truncate pitch to 2000 chars so keyword scorer stays fast
-        # and the model can't game the scorer with degenerate long strings.
-        raw_pitch = (action.coalition_pitch or "") if hasattr(action, "coalition_pitch") else ""
-        pitch_text = raw_pitch[:2000]
+        # Pass current trust so high-trust NPCs carry more vote weight.
+        pitch_text = (action.coalition_pitch or "") if hasattr(action, "coalition_pitch") else ""
         winning_decision, vote_tally, pitch_scores = self._resolve_vote(
-            decision, npc_statements, event["options"], pitch=pitch_text,
+            decision, npc_statements, event["options"],
+            pitch=pitch_text, trust=s["trust"],
         )
 
         # Snapshot pre-state for reward shaping.
