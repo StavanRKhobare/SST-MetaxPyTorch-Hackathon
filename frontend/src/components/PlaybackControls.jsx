@@ -11,10 +11,10 @@ export default function PlaybackControls({
     onSpeedChange,
 }) {
     const canStep = !loading && !done && !!obs
-    const statusText = loading ? 'Processing…'
-        : done ? 'Episode complete'
-            : paused ? 'Paused'
-                : 'Running'
+    const statusText = loading ? 'PROCESSING...'
+        : done ? 'EPISODE_DONE'
+            : paused ? 'PAUSED'
+                : 'RUNNING'
 
     const statusDot = loading ? '' : done ? '' : paused ? 'paused' : 'running'
 
@@ -22,28 +22,28 @@ export default function PlaybackControls({
         <div className="playback-bar">
             {paused && !done ? (
                 <button className="pb-btn primary" onClick={onRun} disabled={loading || !obs}>
-                    ▶ Run Agent
+                    ▶ RUN_AGENT
                 </button>
             ) : (
                 <button className="pb-btn" onClick={onPause} disabled={loading || done}>
-                    ⏸ Pause
+                    ⏸ PAUSE
                 </button>
             )}
 
             <button className="pb-btn" onClick={onStep} disabled={!canStep}>
-                ⏭ Step
+                ⏭ STEP
             </button>
 
             <div className="pb-divider" />
 
             <button className="pb-btn" onClick={onReset} disabled={loading}>
-                ↺ Reset
+                ↺ RESET
             </button>
 
             <div className="pb-divider" />
 
             <div className="speed-control">
-                <span>Speed</span>
+                <span>SPEED</span>
                 <input
                     type="range"
                     min={0.5}
@@ -52,7 +52,7 @@ export default function PlaybackControls({
                     value={speed}
                     onChange={(e) => onSpeedChange(parseFloat(e.target.value))}
                 />
-                <span className="speed-label">{speed.toFixed(2)}×</span>
+                <span className="speed-label">{speed.toFixed(2)}x</span>
             </div>
 
             <div className="pb-status">

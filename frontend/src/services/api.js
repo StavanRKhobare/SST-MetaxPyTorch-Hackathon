@@ -52,3 +52,18 @@ export async function apiHealth() {
         return false
     }
 }
+/**
+ * POST /qwen/decide — ask the backend Qwen/Ollama proxy for a decision.
+ * Falls back to greedy on the server side if Ollama is unavailable.
+ * @param {object} obs  The current BoardSimObservation from state
+ * @returns {Promise<{ decision: string, coalition_pitch: string, source: string }>}
+ */
+export async function apiQwenDecide(obs) {
+    return _post('/qwen/decide', {
+        state:          obs.state ?? {},
+        event:          obs.event ?? '',
+        options:        obs.options ?? [],
+        npc_statements: obs.npc_statements ?? [],
+        round:          obs.round ?? 1,
+    })
+}

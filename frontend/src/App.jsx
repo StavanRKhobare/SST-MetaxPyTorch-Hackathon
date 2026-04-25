@@ -89,8 +89,11 @@ export default function App() {
                 <div className="col-right">
                     {lastInfo?.winning_vote_tally && <VoteTally info={lastInfo} />}
                     {!lastInfo && (
-                        <div className="card" style={{ fontSize: '0.72rem', color: 'var(--text-muted)', textAlign: 'center', padding: '2rem 1rem' }}>
-                            Vote tally appears here after the first decision.
+                        <div className="card">
+                            <div className="section-label">Vote Tally</div>
+                            <div className="card-body" style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textAlign: 'center', padding: '1.25rem 1rem' }}>
+                                // vote tally appears after first decision.
+                            </div>
                         </div>
                     )}
                 </div>

@@ -392,13 +392,15 @@ class BoardSimEnvironment(Environment):
         return random.Random(h)
 
     def _simulate_npc(
-        self, role: str, round_idx: int, state: Dict[str, Any]
+        self, role: str, event_idx: int, state: Dict[str, Any], round_label: int = 0
     ) -> Dict[str, Any]:
         """Deterministic NPC: rank options by agenda-weighted projected delta
         plus small seeded noise; pick argmax; emit statement + vote + confidence.
         Uses per-episode jittered agendas so the optimal path varies by seed."""
-        rng = self._npc_rng(role, round_idx)
-        event = EVENTS[round_idx]
+        # Use round_label for RNG so personality varies by "time" in episode,
+        # but event_idx to pull the correct options and consequences.
+        rng = self._npc_rng(role, round_label)
+        event = EVENTS[event_idx]
         agenda = self._episode_agendas[role]  # per-episode jittered weights
 
         # Trust modulates how much the NPC "leans toward" the CEO's direction.
@@ -435,7 +437,7 @@ class BoardSimEnvironment(Environment):
         # Pick a phrase deterministically per (round, role), state-aware.
         mode = "crisis" if _crisis_mode(state) else "calm"
         phrase_pool = PHRASES[role][mode]
-        phrase = phrase_pool[round_idx % len(phrase_pool)]
+        phrase = phrase_pool[round_label % len(phrase_pool)]
         statement = f"{phrase} I'm voting {chosen}."
 
         return {
@@ -445,8 +447,8 @@ class BoardSimEnvironment(Environment):
             "confidence": confidence,
         }
 
-    def _simulate_all_npcs(self, round_idx: int, state: Dict[str, Any]) -> List[Dict[str, Any]]:
-        return [self._simulate_npc(role, round_idx, state) for role in NPC_AGENDAS]
+    def _simulate_all_npcs(self, event_idx: int, state: Dict[str, Any], round_label: int = 0) -> List[Dict[str, Any]]:
+        return [self._simulate_npc(role, event_idx, state, round_label=round_label) for role in NPC_AGENDAS]
 
     # ------------------------------------------------------------------ obs
     def _obs_state(self) -> Dict[str, Any]:
@@ -470,6 +472,7 @@ class BoardSimEnvironment(Environment):
             event = EVENTS[shuffled_idx]
             event_desc = f"{event['title']} — {event['description']}"
             options = list(event["options"])
+        shuffled_idx = self._event_order[round_idx] if hasattr(self, '_event_order') else round_idx
         return BoardSimObservation(
             state=self._obs_state(),
             event=event_desc,
@@ -478,6 +481,7 @@ class BoardSimEnvironment(Environment):
             round=self._state.state_dict["round"],
             done=done,
             reward=float(reward),
+            event_idx=shuffled_idx,
         )
 
     # ------------------------------------------------------------------ reset
@@ -532,7 +536,8 @@ class BoardSimEnvironment(Environment):
                     noise = rng.gauss(0.0, 0.15)  # ±15% std
                     self._consequence_noise[idx][opt][k] = noise
 
-        npc_statements = self._simulate_all_npcs(0, self._state.state_dict)
+        shuffled_idx = self._event_order[0]
+        npc_statements = self._simulate_all_npcs(shuffled_idx, self._state.state_dict, round_label=0)
         return self._build_obs(round_idx=0, npc_statements=npc_statements, reward=0.0, done=False)
 
     # ------------------------------------------------------------------ step
@@ -638,7 +643,7 @@ class BoardSimEnvironment(Environment):
         decision = event["options"][0] if invalid_action else action.decision
 
         # NPC votes (DETERMINISTIC — same as what was shown in last obs).
-        npc_statements = self._simulate_all_npcs(round_idx, s)
+        npc_statements = self._simulate_all_npcs(shuffled_idx, s, round_label=round_idx)
 
         # Resolve weighted vote (with optional persuasion via coalition_pitch).
         # Pass current trust so high-trust NPCs carry more vote weight.
@@ -753,13 +758,14 @@ class BoardSimEnvironment(Environment):
         # ----- Build next observation -----
         if terminal_now or s["round"] > len(EVENTS):
             next_npcs: List[Dict[str, Any]] = []
-            next_round_idx = min(s["round"] - 1, len(EVENTS) - 1)
+            next_event_idx = min(s["round"] - 1, len(EVENTS) - 1)
         else:
             next_round_idx = s["round"] - 1
-            next_npcs = self._simulate_all_npcs(next_round_idx, s)
+            next_event_idx = self._event_order[next_round_idx] if hasattr(self, '_event_order') else next_round_idx
+            next_npcs = self._simulate_all_npcs(next_event_idx, s, round_label=next_round_idx)
 
         return self._build_obs(
-            round_idx=next_round_idx,
+            round_idx=min(s["round"] - 1, len(EVENTS) - 1),
             npc_statements=next_npcs,
             reward=reward,
             done=terminal_now,

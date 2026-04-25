@@ -27,9 +27,12 @@ except (ImportError, ValueError):
     from models import BoardSimAction, BoardSimObservation  # type: ignore
     from server.board_sim_env_environment import BoardSimEnvironment  # type: ignore
 
+import json
+import httpx
+
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from starlette.middleware.cors import CORSMiddleware
 
 
@@ -82,6 +85,40 @@ class GameStepRequest(BaseModel):
     coalition_pitch: str = ""
 
 
+class QwenDecideRequest(BaseModel):
+    """Board observation forwarded from the frontend for Qwen inference."""
+    state: Dict[str, Any]
+    event: str
+    options: List[str]
+    npc_statements: List[Dict[str, Any]] = []
+    round: int = 1
+
+
+# ── Greedy fallback (mirrors frontend greedyPick) ──────────────────
+_ROLE_WEIGHT = {
+    'CEO': 1.5, 'CTO': 1.2, 'CFO': 1.0, 'Investor Rep': 1.3, 'Independent': 0.8,
+}
+
+def _greedy_pick(options: List[str], npc_statements: List[Dict[str, Any]]) -> str:
+    tally = {opt: 0.0 for opt in options}
+    for npc in npc_statements:
+        vote = npc.get('vote', '')
+        if vote in tally:
+            tally[vote] += _ROLE_WEIGHT.get(npc.get('role', ''), 0.8) * float(npc.get('confidence', 0.5))
+    return max(tally, key=lambda k: tally[k])
+
+
+# ── Qwen system prompt ─────────────────────────────────────────────
+_QWEN_SYSTEM = (
+    "You are the CEO agent in a boardroom simulation. "
+    "Given the board state and NPC positions, choose the best strategic decision "
+    "and craft a short coalition pitch to win over dissenters. "
+    "Always respond with ONLY a valid JSON object in the exact format: "
+    '{"decision": "<one of the listed options>", "coalition_pitch": "<1-2 sentence pitch>"}'
+    " — no markdown, no explanation, no extra keys."
+)
+
+
 # ── Create the openenv app (for /health, /schema, /ws, etc.) ───────
 app = create_app(
     BoardSimEnvironment,
@@ -112,6 +149,76 @@ def game_reset(req: GameResetRequest):
 def game_step(req: GameStepRequest):
     """Step the persistent game environment with the given decision."""
     return _game.step(decision=req.decision, coalition_pitch=req.coalition_pitch)
+
+
+# ── LM Studio Local Server Config ──────────────────────────────────
+_LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
+
+
+@app.post("/qwen/decide")
+async def qwen_decide(req: QwenDecideRequest):
+    """
+    Call the Qwen model via local LM Studio server.
+    Returns {decision, coalition_pitch, source} where source is
+    'qwen_lmstudio' on success or 'local_error_fallback' on failure.
+    """
+    npc_summary = "\n".join(
+        f"  - {n.get('role','?')} ({n.get('role','?')}): votes '{n.get('vote','?')}' "
+        f"(confidence {n.get('confidence', 0.5):.2f}) — '{n.get('statement','')[:120]}'"
+        for n in req.npc_statements
+    )
+    user_prompt = (
+        f"Round: {req.round}\n"
+        f"Company state: {json.dumps(req.state)}\n"
+        f"Current crisis/event: {req.event}\n"
+        f"Available options: {req.options}\n"
+        f"Board member positions:\n{npc_summary}\n\n"
+        "Your JSON decision:"
+    )
+
+    try:
+        # payload for OpenAI-compatible local server (LM Studio)
+        payload = {
+            "model": "qwen", # LM Studio usually ignores this and uses the loaded model
+            "messages": [
+                {"role": "system", "content": _QWEN_SYSTEM},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "temperature": 0.1,
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(_LM_STUDIO_URL, json=payload)
+            
+        resp.raise_for_status()
+        data = resp.json()
+        raw_content = data["choices"][0]["message"]["content"].strip()
+
+        # Handle potential markdown code blocks
+        if "```json" in raw_content:
+            raw_content = raw_content.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw_content:
+            raw_content = raw_content.split("```")[1].split("```")[0].strip()
+
+        parsed = json.loads(raw_content)
+        decision = str(parsed.get("decision", "")).strip()
+        pitch = str(parsed.get("coalition_pitch", "")).strip()
+
+        # Validate decision is one of the legal options
+        if decision not in req.options:
+            decision = _greedy_pick(req.options, req.npc_statements)
+
+        return {"decision": decision, "coalition_pitch": pitch, "source": "qwen_lmstudio"}
+
+    except Exception as exc:
+        # LM Studio not running or model not loaded → greedy fallback
+        fallback = _greedy_pick(req.options, req.npc_statements)
+        return {
+            "decision": fallback,
+            "coalition_pitch": "",
+            "source": "greedy_fallback",
+            "error": str(exc),
+        }
 
 
 # ── Entry point ────────────────────────────────────────────────────
